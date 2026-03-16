@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: momentum-dashboard
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:server --workers 1 --threads 2 --timeout 120
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
