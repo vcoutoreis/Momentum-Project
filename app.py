@@ -16,7 +16,6 @@ import requests
 import yfinance as yf
 import joblib
 from bs4 import BeautifulSoup
-from scipy import stats
 
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
