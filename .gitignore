@@ -1,0 +1,4 @@
+.diskcache/
+__pycache__/
+*.pyc
+.env

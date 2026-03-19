@@ -39,12 +39,7 @@ NUM_STOCKS = 20
 LOOKBACK_LONG = 252
 LOOKBACK_SKIP = 21
 VOL_WINDOW = 63
-# CACHE_FILE    = Path(__file__).parent / "sp500_prices_cache.csv"
-# ADD these lines:
-import diskcache
-
-_cache = diskcache.Cache(Path(__file__).parent / ".diskcache")
-CACHE_TTL = 60 * 60 * 6  # 6-hour TTL (seconds)
+CACHE_FILE = Path(__file__).parent / "sp500_prices_cache.csv"
 
 
 END_DATE = datetime.today().strftime("%Y-%m-%d")
@@ -135,40 +130,14 @@ def download_prices(tickers, start, end, batch_size=100):
     return prices
 
 
-# def load_data():
-#     constituents = download_sp500_constituents()
-#     if CACHE_FILE.exists():
-#         prices_raw = pd.read_csv(CACHE_FILE, index_col=0, parse_dates=True)
-#     else:
-#         all_tickers = constituents["ticker"].tolist() + ["^GSPC"]
-#         prices_raw  = download_prices(all_tickers, START_DATE, END_DATE)
-#         prices_raw.to_csv(CACHE_FILE)
-
-#     bench_series = prices_raw["^GSPC"].copy() if "^GSPC" in prices_raw.columns else None
-#     stocks = prices_raw.drop(columns=["^GSPC"], errors="ignore")
-#     stocks = stocks.loc[:, stocks.notna().mean() >= 0.70].ffill(limit=5)
-
-#     bench_prices  = bench_series.dropna()
-#     bench_returns = np.log(bench_prices / bench_prices.shift(1)).to_frame("SP500")
-
-#     sector_map = (
-#         constituents.set_index("ticker")[["gics_sector","company"]]
-#         .reindex(stocks.columns)
-#         .fillna("Unknown")
-#     )
-#     return stocks, bench_prices, bench_returns, sector_map
-
-
 def load_data():
     constituents = download_sp500_constituents()
-
-    # ── Cache lookup ──────────────────────────────────────────────────────
-    prices_raw = _cache.get("sp500_prices")
-    if prices_raw is None:
+    if CACHE_FILE.exists():
+        prices_raw = pd.read_csv(CACHE_FILE, index_col=0, parse_dates=True)
+    else:
         all_tickers = constituents["ticker"].tolist() + ["^GSPC"]
         prices_raw = download_prices(all_tickers, START_DATE, END_DATE)
-        _cache.set("sp500_prices", prices_raw, expire=CACHE_TTL)
-    # ─────────────────────────────────────────────────────────────────────
+        prices_raw.to_csv(CACHE_FILE)
 
     bench_series = prices_raw["^GSPC"].copy() if "^GSPC" in prices_raw.columns else None
     stocks = prices_raw.drop(columns=["^GSPC"], errors="ignore")
@@ -453,65 +422,33 @@ strategy = MomentumStrategy()
 METHODS = ["classic", "risk_adjusted", "composite", "volatility_filtered"]
 
 # ── Backtests ───────────────────────────────────────────────────────────────────────────────
-# Cache version — increment this if backtest logic changes to force recompute
-CACHE_VERSION = "v2"
-_cached_bt = _cache.get(f"backtest_results_{CACHE_VERSION}")
-if _cached_bt is not None:
-    print("Loading backtests from cache…")
-    results, all_stats, all_holdings = _cached_bt
-else:
-    print("Running backtests…")
-    results, all_stats, all_holdings = {}, {}, {}
-    for m in METHODS:
-        eq, st, hold = strategy.backtest(prices, bench_returns["SP500"], method=m)
-        results[m], all_stats[m], all_holdings[m] = eq, st, hold
-    bench_m = bench_returns["SP500"].resample("ME").apply(lambda x: (1 + x).prod() - 1)
-    bench_eq = (1 + bench_m).cumprod()
-    results["S&P 500"] = bench_eq
-    all_stats["S&P 500"] = strategy._calc_stats(
-        bench_m, bench_eq, bench_returns["SP500"]
-    )
-    _cache.set(
-        f"backtest_results_{CACHE_VERSION}",
-        (results, all_stats, all_holdings),
-        expire=CACHE_TTL,
-    )
+print("Running backtests…")
+results, all_stats, all_holdings = {}, {}, {}
+for m in METHODS:
+    eq, st, hold = strategy.backtest(prices, bench_returns["SP500"], method=m)
+    results[m], all_stats[m], all_holdings[m] = eq, st, hold
+bench_m = bench_returns["SP500"].resample("ME").apply(lambda x: (1 + x).prod() - 1)
+bench_eq = (1 + bench_m).cumprod()
+results["S&P 500"] = bench_eq
+all_stats["S&P 500"] = strategy._calc_stats(
+    bench_m, bench_eq, bench_returns["SP500"]
+)
 
 bench_m = bench_returns["SP500"].resample("ME").apply(lambda x: (1 + x).prod() - 1)
 bench_eq = (1 + bench_m).cumprod()
 
 # ── ML dataset ─────────────────────────────────────────────────────────────────────────
-_cached_ml = _cache.get("ml_dataset")
-if _cached_ml is not None:
-    print("Loading ML dataset from cache…")
-    ml_df = _cached_ml
-else:
-    print("Building ML dataset…")
-    rebal_dates_raw = prices.resample("ME").last().index
-    min_start = prices.index[strategy.lookback_long]
-    rebal_dates_raw = rebal_dates_raw[rebal_dates_raw >= min_start]
-    snap_idx = prices.index.get_indexer(rebal_dates_raw, method="ffill")
-    rebal_dates = prices.index[snap_idx[snap_idx >= 0]]
-    ml_df = build_ml_dataset(prices, returns_log, rebal_dates)
-    _cache.set("ml_dataset", ml_df, expire=CACHE_TTL)
+print("Building ML dataset…")
+rebal_dates_raw = prices.resample("ME").last().index
+min_start = prices.index[strategy.lookback_long]
+rebal_dates_raw = rebal_dates_raw[rebal_dates_raw >= min_start]
+snap_idx = prices.index.get_indexer(rebal_dates_raw, method="ffill")
+rebal_dates = prices.index[snap_idx[snap_idx >= 0]]
+ml_df = build_ml_dataset(prices, returns_log, rebal_dates)
 
 # ── ML models ──────────────────────────────────────────────────────────────────────────
-_cached_models = _cache.get("ml_models")
-if _cached_models is not None and "cv_scores" not in _cached_models[0].get("Ridge", {}):
-    print("Stale ML cache detected — rebuilding with tuning…")
-    _cache.delete("ml_models")
-    _cached_models = None
-
-if _cached_models is not None:
-    print("Loading ML models from cache…")
-    ml_results, X_test, y_test, split_idx = _cached_models
-    tuning_log = {
-        n: ml_results[n]["cv_scores"] for n in ["Ridge", "Random Forest", "XGBoost"]
-    }
-else:
-    print("Training ML models…")
-    ml_results, X_test, y_test, split_idx, tuning_log = train_models(ml_df)
-    _cache.set("ml_models", (ml_results, X_test, y_test, split_idx), expire=CACHE_TTL)
+print("Training ML models…")
+ml_results, X_test, y_test, split_idx, tuning_log = train_models(ml_df)
 
 xgb_model = ml_results["XGBoost"]["model"]
 feat_imp = pd.Series(
@@ -703,18 +640,6 @@ sidebar = html.Div(
             color="primary",
             className="w-100",
             style={"borderRadius": "8px", "fontWeight": "700"},
-        ),
-        # ADD THESE TWO LINES:
-        dbc.Button(
-            "🔄  Refresh Data",
-            id="refresh-btn",
-            color="secondary",
-            className="w-100 mt-2",
-            style={"borderRadius": "8px"},
-        ),
-        html.Div(
-            id="refresh-msg",
-            style={"color": TXT_MUTE, "fontSize": "11px", "marginTop": "6px"},
         ),
     ],
     style={
@@ -929,18 +854,6 @@ app.layout = html.Div(
 def update_slider_labels(n, lb):
     return f"{n} stocks", f"{lb} mo"
 
-
-@app.callback(
-    Output("refresh-msg", "children"),
-    Input("refresh-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def refresh_data(n_clicks):
-    _cache.delete("sp500_prices")
-    _cache.delete(f"backtest_results_{CACHE_VERSION}")
-    _cache.delete("ml_dataset")
-    _cache.delete("ml_models")
-    return "✅ All caches cleared — restart app to re-download."
 
 
 @app.callback(
