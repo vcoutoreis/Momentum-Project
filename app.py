@@ -4,7 +4,7 @@ E628: Data Science for Business
 All calculations in Python/pandas; UI in Dash + Plotly.
 """
 
-import warnings, time, os
+import warnings, time, os, threading
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -129,12 +129,21 @@ def download_prices(tickers, start, end, batch_size=100):
     prices.columns = [str(c) for c in prices.columns]
     return prices
 
-
 def load_data():
-    constituents = download_sp500_constituents()
     if CACHE_FILE.exists():
         prices_raw = pd.read_csv(CACHE_FILE, index_col=0, parse_dates=True)
+        try:
+            constituents = download_sp500_constituents()
+        except Exception:
+            # If Wikipedia is unreachable, create a minimal sector map
+            tickers = [c for c in prices_raw.columns if c != "^GSPC"]
+            constituents = pd.DataFrame({
+                "ticker": tickers,
+                "company": tickers,
+                "gics_sector": "Unknown",
+            })
     else:
+        constituents = download_sp500_constituents()
         all_tickers = constituents["ticker"].tolist() + ["^GSPC"]
         prices_raw = download_prices(all_tickers, START_DATE, END_DATE)
         prices_raw.to_csv(CACHE_FILE)
@@ -413,63 +422,80 @@ def train_models(ml_df):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bootstrap the data & models on startup (cached in module scope)
-# ─────────────────────────────────────────────────────────────────────────────
-print("Loading data…")
-prices, bench_prices, bench_returns, sector_map = load_data()
-returns_log = np.log(prices / prices.shift(1))
-strategy = MomentumStrategy()
-METHODS = ["classic", "risk_adjusted", "composite", "volatility_filtered"]
-
-# ── Backtests ───────────────────────────────────────────────────────────────────────────────
-print("Running backtests…")
-results, all_stats, all_holdings = {}, {}, {}
-for m in METHODS:
-    eq, st, hold = strategy.backtest(prices, bench_returns["SP500"], method=m)
-    results[m], all_stats[m], all_holdings[m] = eq, st, hold
-bench_m = bench_returns["SP500"].resample("ME").apply(lambda x: (1 + x).prod() - 1)
-bench_eq = (1 + bench_m).cumprod()
-results["S&P 500"] = bench_eq
-all_stats["S&P 500"] = strategy._calc_stats(
-    bench_m, bench_eq, bench_returns["SP500"]
-)
-
-bench_m = bench_returns["SP500"].resample("ME").apply(lambda x: (1 + x).prod() - 1)
-bench_eq = (1 + bench_m).cumprod()
-
-# ── ML dataset ─────────────────────────────────────────────────────────────────────────
-print("Building ML dataset…")
-rebal_dates_raw = prices.resample("ME").last().index
-min_start = prices.index[strategy.lookback_long]
-rebal_dates_raw = rebal_dates_raw[rebal_dates_raw >= min_start]
-snap_idx = prices.index.get_indexer(rebal_dates_raw, method="ffill")
-rebal_dates = prices.index[snap_idx[snap_idx >= 0]]
-ml_df = build_ml_dataset(prices, returns_log, rebal_dates)
-
-# ── ML models ──────────────────────────────────────────────────────────────────────────
-print("Training ML models…")
-ml_results, X_test, y_test, split_idx, tuning_log = train_models(ml_df)
-
-xgb_model = ml_results["XGBoost"]["model"]
-feat_imp = pd.Series(
-    xgb_model.named_steps["model"].feature_importances_
-    if hasattr(xgb_model, "named_steps")
-    else xgb_model.feature_importances_,
-    index=FEATURE_COLS,
-).sort_values()
-
-latest_date = prices.index[-1]
-print("Startup complete ✅")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Dash App
+# Create Dash App FIRST so gunicorn can bind the port immediately
 # ─────────────────────────────────────────────────────────────────────────────
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.DARKLY],
     title="Momentum Investing Dashboard",
+    suppress_callback_exceptions=True,
 )
+server = app.server  # expose Flask server for gunicorn
+
+# ── Global state ─────────────────────────────────────────────────────────────
+data_ready = False
+prices = bench_prices = bench_returns = sector_map = None
+returns_log = None
+strategy = None
+METHODS = ["classic", "risk_adjusted", "composite", "volatility_filtered"]
+results, all_stats, all_holdings = {}, {}, {}
+bench_m = bench_eq = None
+ml_df = None
+ml_results = X_test = y_test = split_idx = tuning_log = None
+feat_imp = None
+latest_date = None
+
+
+def _bootstrap():
+    """Run heavy computation in background so the server can start immediately."""
+    global data_ready, prices, bench_prices, bench_returns, sector_map
+    global returns_log, strategy, results, all_stats, all_holdings
+    global bench_m, bench_eq, ml_df, ml_results, X_test, y_test
+    global split_idx, tuning_log, feat_imp, latest_date
+
+    print("Loading data…")
+    prices, bench_prices, bench_returns, sector_map = load_data()
+    returns_log = np.log(prices / prices.shift(1))
+    strategy = MomentumStrategy()
+
+    print("Running backtests…")
+    results, all_stats, all_holdings = {}, {}, {}
+    for m in METHODS:
+        eq, st, hold = strategy.backtest(prices, bench_returns["SP500"], method=m)
+        results[m], all_stats[m], all_holdings[m] = eq, st, hold
+    bench_m = bench_returns["SP500"].resample("ME").apply(lambda x: (1 + x).prod() - 1)
+    bench_eq = (1 + bench_m).cumprod()
+    results["S&P 500"] = bench_eq
+    all_stats["S&P 500"] = strategy._calc_stats(
+        bench_m, bench_eq, bench_returns["SP500"]
+    )
+
+    print("Building ML dataset…")
+    rebal_dates_raw = prices.resample("ME").last().index
+    min_start = prices.index[strategy.lookback_long]
+    rebal_dates_raw = rebal_dates_raw[rebal_dates_raw >= min_start]
+    snap_idx = prices.index.get_indexer(rebal_dates_raw, method="ffill")
+    rebal_dates = prices.index[snap_idx[snap_idx >= 0]]
+    ml_df = build_ml_dataset(prices, returns_log, rebal_dates)
+
+    print("Training ML models…")
+    ml_results, X_test, y_test, split_idx, tuning_log = train_models(ml_df)
+
+    xgb_model = ml_results["XGBoost"]["model"]
+    feat_imp = pd.Series(
+        xgb_model.named_steps["model"].feature_importances_
+        if hasattr(xgb_model, "named_steps")
+        else xgb_model.feature_importances_,
+        index=FEATURE_COLS,
+    ).sort_values()
+
+    latest_date = prices.index[-1]
+    data_ready = True
+    print("Startup complete ✅")
+
+
+# Start computation in background thread
+threading.Thread(target=_bootstrap, daemon=True).start()
 
 # --- ADD THIS BLOCK ---
 # This overrides the base HTML template to inject our custom CSS
@@ -701,154 +727,176 @@ def stat_badge(label, value, color=TXT_MAIN):
 
 
 # ── Layout ────────────────────────────────────────────────────────────────────
-app.layout = html.Div(
-    [
-        sidebar,
-        html.Div(
+def serve_layout():
+    if not data_ready:
+        return html.Div(
             [
-                # ── Header ─────────────────────────────────────────────────────────
                 html.Div(
                     [
-                        html.H3(
-                            "Momentum Investing Dashboard",
-                            style={
-                                "color": TXT_MAIN,
-                                "fontWeight": "800",
-                                "margin": "0",
-                            },
-                        ),
-                        html.P(
-                            id="header-subtitle",
-                            children=f"S&P 500 · {prices.index[0].date()} → {prices.index[-1].date()} · {prices.shape[1]} clean tickers · lookback: 12m · {NUM_STOCKS} stocks",
-                            style={
-                                "color": TXT_MUTE,
-                                "fontSize": "13px",
-                                "margin": "0",
-                            },
-                        ),
+                        html.H3("📈 Momentum Investing Dashboard", style={"color": TXT_MAIN, "fontWeight": "800"}),
+                        html.Hr(style={"borderColor": "#2a2f45"}),
+                        html.H5("Loading data, running backtests & training ML models…", style={"color": TXT_MUTE}),
+                        html.P("This takes 2–4 minutes on the free tier. The page will auto-refresh when ready.", style={"color": TXT_MUTE, "fontSize": "14px"}),
+                        # Auto-refresh every 10 seconds until data is ready
+                        html.Meta(httpEquiv="refresh", content="10"),
                     ],
-                    style={"marginBottom": "24px"},
-                ),
-                dcc.Loading(
-                    id="loading-main",
-                    type="circle",
-                    children=[
-                        # ── KPI row ─────────────────────────────────────────────────────
-                        html.Div(
-                            id="kpi-row",
-                            style={
-                                "display": "flex",
-                                "gap": "12px",
-                                "flexWrap": "wrap",
-                                "marginBottom": "20px",
-                            },
-                        ),
-                        # ── Tabs ────────────────────────────────────────────────────────
-                        dcc.Tabs(
-                            id="tabs",
-                            value="tab-backtest",
-                            children=[
-                                dcc.Tab(
-                                    label="📈 Equity Curves",
-                                    value="tab-backtest",
-                                    style={
-                                        "backgroundColor": BG_CARD,
-                                        "color": TXT_MUTE,
-                                        "border": "none",
-                                    },
-                                    selected_style={
-                                        "backgroundColor": "#3498DB22",
-                                        "color": TXT_MAIN,
-                                        "border": "none",
-                                    },
-                                ),
-                                dcc.Tab(
-                                    label="📉 Drawdown & Risk",
-                                    value="tab-risk",
-                                    style={
-                                        "backgroundColor": BG_CARD,
-                                        "color": TXT_MUTE,
-                                        "border": "none",
-                                    },
-                                    selected_style={
-                                        "backgroundColor": "#3498DB22",
-                                        "color": TXT_MAIN,
-                                        "border": "none",
-                                    },
-                                ),
-                                dcc.Tab(
-                                    label="🎯 Signal Explorer",
-                                    value="tab-signals",
-                                    style={
-                                        "backgroundColor": BG_CARD,
-                                        "color": TXT_MUTE,
-                                        "border": "none",
-                                    },
-                                    selected_style={
-                                        "backgroundColor": "#3498DB22",
-                                        "color": TXT_MAIN,
-                                        "border": "none",
-                                    },
-                                ),
-                                dcc.Tab(
-                                    label="⚙️  Parameter Sweep",
-                                    value="tab-sweep",
-                                    style={
-                                        "backgroundColor": BG_CARD,
-                                        "color": TXT_MUTE,
-                                        "border": "none",
-                                    },
-                                    selected_style={
-                                        "backgroundColor": "#3498DB22",
-                                        "color": TXT_MAIN,
-                                        "border": "none",
-                                    },
-                                ),
-                                dcc.Tab(
-                                    label="🤖 ML Ranker",
-                                    value="tab-ml",
-                                    style={
-                                        "backgroundColor": BG_CARD,
-                                        "color": TXT_MUTE,
-                                        "border": "none",
-                                    },
-                                    selected_style={
-                                        "backgroundColor": "#3498DB22",
-                                        "color": TXT_MAIN,
-                                        "border": "none",
-                                    },
-                                ),
-                                dcc.Tab(
-                                    label="📋 Portfolio",
-                                    value="tab-portfolio",
-                                    style={
-                                        "backgroundColor": BG_CARD,
-                                        "color": TXT_MUTE,
-                                        "border": "none",
-                                    },
-                                    selected_style={
-                                        "backgroundColor": "#3498DB22",
-                                        "color": TXT_MAIN,
-                                        "border": "none",
-                                    },
-                                ),
-                            ],
-                            style={"marginBottom": "16px"},
-                        ),
-                        html.Div(id="tab-content"),
-                    ],
-                ),
+                    style={"padding": "60px", "textAlign": "center"},
+                )
             ],
-            style={
-                "marginLeft": "260px",
-                "padding": "32px",
-                "backgroundColor": BG_PAGE,
-                "minHeight": "100vh",
-            },
-        ),
-    ],
-    style={"backgroundColor": BG_PAGE},
-)
+            style={"backgroundColor": BG_PAGE, "minHeight": "100vh"},
+        )
+
+    return html.Div(
+        [
+            sidebar,
+            html.Div(
+                [
+                    # ── Header ─────────────────────────────────────────────────────────
+                    html.Div(
+                        [
+                            html.H3(
+                                "Momentum Investing Dashboard",
+                                style={
+                                    "color": TXT_MAIN,
+                                    "fontWeight": "800",
+                                    "margin": "0",
+                                },
+                            ),
+                            html.P(
+                                id="header-subtitle",
+                                children=f"S&P 500 · {prices.index[0].date()} → {prices.index[-1].date()} · {prices.shape[1]} clean tickers · lookback: 12m · {NUM_STOCKS} stocks",
+                                style={
+                                    "color": TXT_MUTE,
+                                    "fontSize": "13px",
+                                    "margin": "0",
+                                },
+                            ),
+                        ],
+                        style={"marginBottom": "24px"},
+                    ),
+                    dcc.Loading(
+                        id="loading-main",
+                        type="circle",
+                        children=[
+                            # ── KPI row ─────────────────────────────────────────────────────
+                            html.Div(
+                                id="kpi-row",
+                                style={
+                                    "display": "flex",
+                                    "gap": "12px",
+                                    "flexWrap": "wrap",
+                                    "marginBottom": "20px",
+                                },
+                            ),
+                            # ── Tabs ────────────────────────────────────────────────────────
+                            dcc.Tabs(
+                                id="tabs",
+                                value="tab-backtest",
+                                children=[
+                                    dcc.Tab(
+                                        label="📈 Equity Curves",
+                                        value="tab-backtest",
+                                        style={
+                                            "backgroundColor": BG_CARD,
+                                            "color": TXT_MUTE,
+                                            "border": "none",
+                                        },
+                                        selected_style={
+                                            "backgroundColor": "#3498DB22",
+                                            "color": TXT_MAIN,
+                                            "border": "none",
+                                        },
+                                    ),
+                                    dcc.Tab(
+                                        label="📉 Drawdown & Risk",
+                                        value="tab-risk",
+                                        style={
+                                            "backgroundColor": BG_CARD,
+                                            "color": TXT_MUTE,
+                                            "border": "none",
+                                        },
+                                        selected_style={
+                                            "backgroundColor": "#3498DB22",
+                                            "color": TXT_MAIN,
+                                            "border": "none",
+                                        },
+                                    ),
+                                    dcc.Tab(
+                                        label="🎯 Signal Explorer",
+                                        value="tab-signals",
+                                        style={
+                                            "backgroundColor": BG_CARD,
+                                            "color": TXT_MUTE,
+                                            "border": "none",
+                                        },
+                                        selected_style={
+                                            "backgroundColor": "#3498DB22",
+                                            "color": TXT_MAIN,
+                                            "border": "none",
+                                        },
+                                    ),
+                                    dcc.Tab(
+                                        label="⚙️  Parameter Sweep",
+                                        value="tab-sweep",
+                                        style={
+                                            "backgroundColor": BG_CARD,
+                                            "color": TXT_MUTE,
+                                            "border": "none",
+                                        },
+                                        selected_style={
+                                            "backgroundColor": "#3498DB22",
+                                            "color": TXT_MAIN,
+                                            "border": "none",
+                                        },
+                                    ),
+                                    dcc.Tab(
+                                        label="🤖 ML Ranker",
+                                        value="tab-ml",
+                                        style={
+                                            "backgroundColor": BG_CARD,
+                                            "color": TXT_MUTE,
+                                            "border": "none",
+                                        },
+                                        selected_style={
+                                            "backgroundColor": "#3498DB22",
+                                            "color": TXT_MAIN,
+                                            "border": "none",
+                                        },
+                                    ),
+                                    dcc.Tab(
+                                        label="📋 Portfolio",
+                                        value="tab-portfolio",
+                                        style={
+                                            "backgroundColor": BG_CARD,
+                                            "color": TXT_MUTE,
+                                            "border": "none",
+                                        },
+                                        selected_style={
+                                            "backgroundColor": "#3498DB22",
+                                            "color": TXT_MAIN,
+                                            "border": "none",
+                                        },
+                                    ),
+                                ],
+                                style={"marginBottom": "16px"},
+                            ),
+                            html.Div(id="tab-content"),
+                        ],
+                    ),
+                ],
+                style={
+                    "marginLeft": "260px",
+                    "padding": "32px",
+                    "backgroundColor": BG_PAGE,
+                    "minHeight": "100vh",
+                },
+            ),
+        ],
+        style={"backgroundColor": BG_PAGE},
+    )
+
+
+app.layout = serve_layout
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2102,7 +2150,6 @@ def tab_portfolio(strat, method, cur_holdings):
     )
 
 
-server = app.server  # expose Flask server for gunicorn
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8050))
