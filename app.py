@@ -641,6 +641,17 @@ sidebar = html.Div(
             className="w-100",
             style={"borderRadius": "8px", "fontWeight": "700"},
         ),
+        dbc.Button(
+            "🔄  Refresh Data",
+            id="refresh-btn",
+            color="secondary",
+            className="w-100 mt-2",
+            style={"borderRadius": "8px"},
+        ),
+        html.Div(
+            id="refresh-msg",
+            style={"color": TXT_MUTE, "fontSize": "11px", "marginTop": "6px"},
+        ),
     ],
     style={
         "width": "240px",
@@ -854,6 +865,52 @@ app.layout = html.Div(
 def update_slider_labels(n, lb):
     return f"{n} stocks", f"{lb} mo"
 
+
+@app.callback(
+    Output("refresh-msg", "children"),
+    Input("refresh-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def refresh_data(n_clicks):
+    global prices, bench_prices, bench_returns, sector_map, returns_log
+    global results, all_stats, all_holdings, bench_m, bench_eq
+    global ml_df, ml_results, X_test, y_test, split_idx, tuning_log, feat_imp, latest_date
+
+    if CACHE_FILE.exists():
+        CACHE_FILE.unlink()
+
+    prices, bench_prices, bench_returns, sector_map = load_data()
+    returns_log = np.log(prices / prices.shift(1))
+
+    strat = MomentumStrategy()
+    results, all_stats, all_holdings = {}, {}, {}
+    for m in METHODS:
+        eq, st, hold = strat.backtest(prices, bench_returns["SP500"], method=m)
+        results[m], all_stats[m], all_holdings[m] = eq, st, hold
+    bench_m = bench_returns["SP500"].resample("ME").apply(lambda x: (1 + x).prod() - 1)
+    bench_eq = (1 + bench_m).cumprod()
+    results["S&P 500"] = bench_eq
+    all_stats["S&P 500"] = strat._calc_stats(bench_m, bench_eq, bench_returns["SP500"])
+
+    rebal_dates_raw = prices.resample("ME").last().index
+    min_start = prices.index[strat.lookback_long]
+    rebal_dates_raw = rebal_dates_raw[rebal_dates_raw >= min_start]
+    snap_idx = prices.index.get_indexer(rebal_dates_raw, method="ffill")
+    rebal_dates = prices.index[snap_idx[snap_idx >= 0]]
+    ml_df = build_ml_dataset(prices, returns_log, rebal_dates)
+
+    ml_results, X_test, y_test, split_idx, tuning_log = train_models(ml_df)
+
+    xgb_model = ml_results["XGBoost"]["model"]
+    feat_imp = pd.Series(
+        xgb_model.named_steps["model"].feature_importances_
+        if hasattr(xgb_model, "named_steps")
+        else xgb_model.feature_importances_,
+        index=FEATURE_COLS,
+    ).sort_values()
+
+    latest_date = prices.index[-1]
+    return f"✅ Refreshed through {latest_date.date()}. Reload the page to see updated charts."
 
 
 @app.callback(
